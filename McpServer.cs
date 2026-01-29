@@ -37,6 +37,18 @@ namespace dnSpy.Extension.MCP {
 			DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
 		};
 
+		readonly struct HttpProcessingResult {
+			public HttpProcessingResult(int statusCode, string? body, bool isJson) {
+				StatusCode = statusCode;
+				Body = body;
+				IsJson = isJson;
+			}
+
+			public int StatusCode { get; }
+			public string? Body { get; }
+			public bool IsJson { get; }
+		}
+
 		/// <summary>
 		/// Initializes the MCP server with the specified settings, tools, and documentation.
 		/// </summary>
@@ -113,18 +125,14 @@ namespace dnSpy.Extension.MCP {
 							using var reader = new StreamReader(context.Request.Body);
 							var body = await reader.ReadToEndAsync();
 
-							var request = JsonSerializer.Deserialize<McpRequest>(body);
-							if (request == null) {
-								context.Response.StatusCode = 400;
-								await context.Response.WriteAsync("Invalid request");
-								return;
+							var result = ProcessRequestBody(body);
+							context.Response.StatusCode = result.StatusCode;
+							if (result.Body != null) {
+								if (result.IsJson) {
+									context.Response.ContentType = "application/json";
+								}
+								await context.Response.WriteAsync(result.Body);
 							}
-
-							var response = HandleRequest(request);
-							var responseJson = JsonSerializer.Serialize(response, jsonOptions);
-
-							context.Response.ContentType = "application/json";
-							await context.Response.WriteAsync(responseJson);
 						}
 						catch (Exception ex) {
 							settings.Log($"ERROR handling request: {ex.Message}");
@@ -212,22 +220,16 @@ namespace dnSpy.Extension.MCP {
 					using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding);
 					var body = reader.ReadToEnd();
 
-					var request = JsonSerializer.Deserialize<McpRequest>(body);
-					if (request == null) {
-						context.Response.StatusCode = 400;
-						var errorBytes = Encoding.UTF8.GetBytes("Invalid request");
-						context.Response.OutputStream.Write(errorBytes, 0, errorBytes.Length);
-						context.Response.Close();
-						return;
+					var result = ProcessRequestBody(body);
+					context.Response.StatusCode = result.StatusCode;
+					if (result.Body != null) {
+						var responseBytes = Encoding.UTF8.GetBytes(result.Body);
+						if (result.IsJson) {
+							context.Response.ContentType = "application/json";
+						}
+						context.Response.ContentLength64 = responseBytes.Length;
+						context.Response.OutputStream.Write(responseBytes, 0, responseBytes.Length);
 					}
-
-					var response = HandleRequest(request);
-					var responseJson = JsonSerializer.Serialize(response, jsonOptions);
-					var responseBytes = Encoding.UTF8.GetBytes(responseJson);
-
-					context.Response.ContentType = "application/json";
-					context.Response.ContentLength64 = responseBytes.Length;
-					context.Response.OutputStream.Write(responseBytes, 0, responseBytes.Length);
 					context.Response.Close();
 				}
 				else {
@@ -261,6 +263,97 @@ namespace dnSpy.Extension.MCP {
 		}
 #endif
 
+		HttpProcessingResult ProcessRequestBody(string body) {
+			try {
+				using var document = JsonDocument.Parse(body);
+				var root = document.RootElement;
+				var responses = new List<McpResponse>();
+				var isBatch = root.ValueKind == JsonValueKind.Array;
+
+				if (isBatch) {
+					if (root.GetArrayLength() == 0) {
+						return new HttpProcessingResult(400, SerializeErrorResponse(-32600, "Invalid Request"), true);
+					}
+
+					foreach (var element in root.EnumerateArray()) {
+						var response = ProcessRequestElement(element);
+						if (response != null) {
+							responses.Add(response);
+						}
+					}
+				}
+				else {
+					var response = ProcessRequestElement(root);
+					if (response != null) {
+						responses.Add(response);
+					}
+				}
+
+				if (responses.Count == 0) {
+					return new HttpProcessingResult(202, null, false);
+				}
+
+				if (isBatch) {
+					return new HttpProcessingResult(200, JsonSerializer.Serialize(responses, jsonOptions), true);
+				}
+
+				return new HttpProcessingResult(200, JsonSerializer.Serialize(responses[0], jsonOptions), true);
+			}
+			catch (JsonException ex) {
+				settings.Log($"ERROR parsing request body: {ex.Message}");
+				return new HttpProcessingResult(400, SerializeErrorResponse(-32700, "Parse error"), true);
+			}
+		}
+
+		McpResponse? ProcessRequestElement(JsonElement element) {
+			if (element.ValueKind != JsonValueKind.Object) {
+				return CreateErrorResponse(-32600, "Invalid Request");
+			}
+
+			if (!element.TryGetProperty("method", out var methodProperty)) {
+				if (element.TryGetProperty("result", out _) || element.TryGetProperty("error", out _)) {
+					return null;
+				}
+				return CreateErrorResponse(-32600, "Invalid Request");
+			}
+
+			if (methodProperty.ValueKind != JsonValueKind.String) {
+				return CreateErrorResponse(-32600, "Invalid Request");
+			}
+
+			var request = JsonSerializer.Deserialize<McpRequest>(element.GetRawText());
+			if (request == null || string.IsNullOrWhiteSpace(request.Method)) {
+				return CreateErrorResponse(-32600, "Invalid Request");
+			}
+
+			if (request.Id == null) {
+				HandleNotification(request);
+				return null;
+			}
+
+			return HandleRequest(request);
+		}
+
+		McpResponse CreateErrorResponse(int code, string message, object? id = null) {
+			return new McpResponse {
+				JsonRpc = "2.0",
+				Id = id,
+				Error = new McpError {
+					Code = code,
+					Message = message
+				}
+			};
+		}
+
+		string SerializeErrorResponse(int code, string message) {
+			var response = CreateErrorResponse(code, message);
+			return JsonSerializer.Serialize(response, jsonOptions);
+		}
+
+		void HandleNotification(McpRequest request) {
+			settings.Log($"MCP notification: {request.Method}");
+		}
+
 		/// <summary>
 		/// Stops the MCP server if it's running.
 		/// </summary>
@@ -288,17 +381,6 @@ namespace dnSpy.Extension.MCP {
 
 		McpResponse HandleRequest(McpRequest request) {
 			try {
-				// Handle notifications (no response needed)
-				if (request.Method.StartsWith("notifications/")) {
-					// Notifications don't require a response, but we log them
-					settings.Log($"MCP notification: {request.Method}");
-					return new McpResponse {
-						JsonRpc = "2.0",
-						Id = request.Id,
-						Result = new { }
-					};
-				}
-
 				settings.Log($"MCP request: {request.Method}");
 
 				var result = request.Method switch {
